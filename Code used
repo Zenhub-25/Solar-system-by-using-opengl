@@ -1,0 +1,359 @@
+# realistic_solar_fixed.py
+# Improved Saturn rings rendering: two-sided, proper normals, alpha blending, clamp-to-edge texture.
+# Requires: PyOpenGL, Pillow, numpy
+from OpenGL.GL import *
+from OpenGL.GLU import *
+from OpenGL.GLUT import *
+from PIL import Image
+import numpy as np
+import math
+import sys
+import os
+
+# --- global state ---
+angle = 0.0
+time_step = 0.6
+win_w, win_h = 1024, 640
+mouse_down = False
+last_x = last_y = 0
+cam_angle_x = 20.0
+cam_angle_y = -30.0
+cam_dist = 25.0
+
+textures = {}
+
+# simple planet data: (name, distance, radius, color or texture, orbit_speed, self_spin_speed, tilt_deg, inclination_deg)
+PLANETS = [
+    ("Mercury", 2.0, 0.18, None, 4.15, 0.02, 0.0, 7.0),
+    ("Venus",   3.0, 0.45, None, 1.62, 0.01, 177.3, 3.4),
+    ("Earth",   4.5, 0.5, "earth.jpg", 1.0, 0.6, 23.5, 0.0),
+    ("Mars",    6.0, 0.27, "mars.jpg", 0.53, 0.5, 25.2, 1.85),
+    ("Jupiter", 8.5, 1.2, "jupiter.jpg", 0.084, 0.8, 3.1, 1.3),
+    ("Saturn", 10.8, 1.0, "saturn.jpg", 0.034, 0.7, 26.7, 2.5),
+    ("Uranus", 13.5, 0.8, None, 0.012, 0.5, 97.8, 0.8),
+    ("Neptune",16.0, 0.75, None, 0.006, 0.4, 28.3, 1.8),
+]
+
+def load_texture(filename, flip=True, force_linear=False):
+    path = os.path.join(os.getcwd(), filename)
+    if not os.path.exists(path):
+        print("Texture not found:", path)
+        return 0
+    img = Image.open(path)
+    if flip:
+        img = img.transpose(Image.FLIP_TOP_BOTTOM)
+    img_data = img.convert("RGBA").tobytes()
+    w, h = img.size
+    tex = glGenTextures(1)
+    glBindTexture(GL_TEXTURE_2D, tex)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+    # filtering
+    if force_linear:
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+    else:
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, img_data)
+    glGenerateMipmap(GL_TEXTURE_2D)
+    glBindTexture(GL_TEXTURE_2D, 0)
+    return tex
+
+def init_textures():
+    global textures
+    names = ["sun.jpg","earth.jpg","earth_clouds.png","mars.jpg","jupiter.jpg","saturn.jpg","saturn_ring.png"]
+    for n in names:
+        if os.path.exists(n):
+            textures[n] = load_texture(n)
+        else:
+            textures[n] = 0
+
+def init_lighting():
+    glEnable(GL_LIGHTING)
+    glEnable(GL_LIGHT0)
+    # Sun as light (positioned at scene origin)
+    ambient = [0.02, 0.02, 0.02, 1.0]
+    diffuse = [1.0, 1.0, 0.9, 1.0]
+    specular = [1.0, 1.0, 0.9, 1.0]
+    glLightfv(GL_LIGHT0, GL_AMBIENT, ambient)
+    glLightfv(GL_LIGHT0, GL_DIFFUSE, diffuse)
+    glLightfv(GL_LIGHT0, GL_SPECULAR, specular)
+    glLightf(GL_LIGHT0, GL_CONSTANT_ATTENUATION, 0.8)
+    glLightf(GL_LIGHT0, GL_LINEAR_ATTENUATION, 0.02)
+    glLightf(GL_LIGHT0, GL_QUADRATIC_ATTENUATION, 0.002)
+
+    glMaterialfv(GL_FRONT, GL_SPECULAR, [0.6,0.6,0.6,1.0])
+    glMaterialf(GL_FRONT, GL_SHININESS, 32.0)
+
+def init_gl():
+    glClearColor(0.0, 0.0, 0.02, 1.0)
+    glEnable(GL_DEPTH_TEST)
+    glEnable(GL_NORMALIZE)
+    glShadeModel(GL_SMOOTH)
+    glEnable(GL_COLOR_MATERIAL)
+    init_lighting()
+    init_textures()
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    # We'll disable culling when drawing rings to ensure both faces are visible
+    glDisable(GL_CULL_FACE)
+
+def draw_sphere(radius, tex_id=0, slices=48, stacks=48):
+    quad = gluNewQuadric()
+    gluQuadricNormals(quad, GLU_SMOOTH)
+    if tex_id:
+        glEnable(GL_TEXTURE_2D)
+        gluQuadricTexture(quad, GL_TRUE)
+        glBindTexture(GL_TEXTURE_2D, tex_id)
+    else:
+        gluQuadricTexture(quad, GL_FALSE)
+    gluSphere(quad, radius, slices, stacks)
+    if tex_id:
+        glBindTexture(GL_TEXTURE_2D, 0)
+        glDisable(GL_TEXTURE_2D)
+    gluDeleteQuadric(quad)
+
+def draw_orbit(distance, tilt=0.0, color=(0.25,0.25,0.25)):
+    glPushMatrix()
+    glRotatef(tilt, 0, 0, 1)
+    glColor3f(*color)
+    glBegin(GL_LINE_LOOP)
+    for i in range(120):
+        a = 2.0 * math.pi * i / 120.0
+        x = math.cos(a) * distance
+        z = math.sin(a) * distance
+        glVertex3f(x, 0.0, z)
+    glEnd()
+    glPopMatrix()
+
+# Improved ring renderer: two-sided, slight thickness, proper normals, alpha-friendly
+def draw_saturn_rings(inner, outer, tex_id=0, segments=360, thickness=0.004):
+    """
+    Draw a two-sided ring in the planet's local coordinate system (centered at origin).
+    The ring lies in the XZ plane (y ~ 0). Call this AFTER translating to planet center and applying axial tilt.
+    inner, outer: radii
+    tex_id: texture id (optional)
+    thickness: small Y-offset to give a tiny thickness to avoid z-fighting and allow lighting on both faces
+    """
+    top_y = thickness * 0.5
+    bot_y = -thickness * 0.5
+
+    if tex_id:
+        glEnable(GL_TEXTURE_2D)
+        glBindTexture(GL_TEXTURE_2D, tex_id)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        # ensure modulation uses texture colors
+        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
+        glColor4f(1.0,1.0,1.0,1.0)
+
+    # Draw top face (normal up)
+    glNormal3f(0.0, 1.0, 0.0)
+    # For correct blending with depth, disable depth write while drawing transparent ring
+    glDepthMask(GL_FALSE)
+    glBegin(GL_TRIANGLE_STRIP)
+    for i in range(segments + 1):
+        a = 2.0 * math.pi * i / segments
+        cos_a = math.cos(a); sin_a = math.sin(a)
+        x_out = outer * cos_a; z_out = outer * sin_a
+        x_in = inner * cos_a;  z_in = inner * sin_a
+        t = i / segments
+        if tex_id:
+            glTexCoord2f(1.0, t)
+        glVertex3f(x_out, top_y, z_out)
+        if tex_id:
+            glTexCoord2f(0.0, t)
+        glVertex3f(x_in, top_y, z_in)
+    glEnd()
+
+    # Draw bottom face (normal down) - reverse winding so the normal points downward
+    glNormal3f(0.0, -1.0, 0.0)
+    glBegin(GL_TRIANGLE_STRIP)
+    for i in range(segments + 1):
+        a = 2.0 * math.pi * i / segments
+        cos_a = math.cos(a); sin_a = math.sin(a)
+        x_out = outer * cos_a; z_out = outer * sin_a
+        x_in = inner * cos_a;  z_in = inner * sin_a
+        t = i / segments
+        if tex_id:
+            glTexCoord2f(1.0, t)
+        glVertex3f(x_out, bot_y, z_out)
+        if tex_id:
+            glTexCoord2f(0.0, t)
+        glVertex3f(x_in, bot_y, z_in)
+    glEnd()
+
+    # Draw inner rim (vertical quads) to catch lighting and silhouette
+    glBegin(GL_QUAD_STRIP)
+    for i in range(segments + 1):
+        a = 2.0 * math.pi * i / segments
+        cos_a = math.cos(a); sin_a = math.sin(a)
+        x_in = inner * cos_a; z_in = inner * sin_a
+        # normal points inward for inner rim
+        nx = -cos_a; nz = -sin_a
+        glNormal3f(nx, 0.0, nz)
+        glVertex3f(x_in, bot_y, z_in)
+        glVertex3f(x_in, top_y, z_in)
+    glEnd()
+
+    # Draw outer rim (vertical quads)
+    glBegin(GL_QUAD_STRIP)
+    for i in range(segments + 1):
+        a = 2.0 * math.pi * i / segments
+        cos_a = math.cos(a); sin_a = math.sin(a)
+        x_out = outer * cos_a; z_out = outer * sin_a
+        # normal points outward for outer rim
+        nx = cos_a; nz = sin_a
+        glNormal3f(nx, 0.0, nz)
+        glVertex3f(x_out, bot_y, z_out)
+        glVertex3f(x_out, top_y, z_out)
+    glEnd()
+
+    # restore depth mask & texture state
+    glDepthMask(GL_TRUE)
+    if tex_id:
+        glBindTexture(GL_TEXTURE_2D, 0)
+        glDisable(GL_TEXTURE_2D)
+    # re-enable face culling if you want elsewhere (we left it disabled globally)
+
+def display():
+    global angle
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+    glMatrixMode(GL_MODELVIEW)
+    glLoadIdentity()
+
+    # camera transform (orbit camera)
+    eye_x = cam_dist * math.cos(math.radians(cam_angle_y)) * math.cos(math.radians(cam_angle_x))
+    eye_y = cam_dist * math.sin(math.radians(cam_angle_x))
+    eye_z = cam_dist * math.sin(math.radians(cam_angle_y)) * math.cos(math.radians(cam_angle_x))
+    gluLookAt(eye_x, eye_y, eye_z, 0, 0, 0, 0, 1, 0)
+
+    glLightfv(GL_LIGHT0, GL_POSITION, [0.0, 0.0, 0.0, 1.0])
+
+    # Sun
+    glPushMatrix()
+    glDisable(GL_LIGHTING)
+    glColor3f(1.0, 0.95, 0.2)
+    if textures.get("sun.jpg"):
+        draw_sphere(1.8, textures["sun.jpg"], 64, 64)
+    else:
+        glutSolidSphere(1.8, 50, 50)
+    glEnable(GL_LIGHTING)
+    glPopMatrix()
+
+    for name, dist, radius, texfile, orbit_speed, spin_speed, tilt, inclination in PLANETS:
+        draw_orbit(dist, inclination)
+        orbit_angle = angle * orbit_speed
+        glPushMatrix()
+        glRotatef(inclination, 0, 0, 1)
+        glRotatef(orbit_angle, 0, 1, 0)
+        glTranslatef(dist, 0, 0)
+        glRotatef(tilt, 0, 0, 1)
+        self_spin = angle * spin_speed * 360.0
+        glRotatef(self_spin, 0, 1, 0)
+
+        if texfile and textures.get(texfile):
+            glColor3f(1,1,1)
+            draw_sphere(radius, textures[texfile])
+        else:
+            colors = {"Mercury":(0.6,0.6,0.6), "Venus":(0.9,0.7,0.4),
+                      "Earth":(0.2,0.4,1.0), "Mars":(0.8,0.3,0.2),
+                      "Jupiter":(1.0,0.8,0.6), "Saturn":(0.95,0.85,0.6),
+                      "Uranus":(0.6,0.9,0.95), "Neptune":(0.4,0.5,0.9)}
+            c = colors.get(name, (0.8,0.8,0.8))
+            glColor3f(*c)
+            glutSolidSphere(radius, 40, 40)
+
+        if name == "Earth":
+            if textures.get("earth_clouds.png"):
+                glEnable(GL_TEXTURE_2D)
+                glBindTexture(GL_TEXTURE_2D, textures["earth_clouds.png"])
+                glColor4f(1,1,1,0.6)
+                quad = gluNewQuadric()
+                gluQuadricTexture(quad, GL_TRUE)
+                gluQuadricNormals(quad, GLU_SMOOTH)
+                gluSphere(quad, radius * 1.02, 48, 48)
+                gluDeleteQuadric(quad)
+                glBindTexture(GL_TEXTURE_2D, 0)
+                glDisable(GL_TEXTURE_2D)
+            glDisable(GL_LIGHTING)
+            glColor4f(0.2, 0.4, 1.0, 0.12)
+            glutSolidSphere(radius * 1.08, 40, 40)
+            glEnable(GL_LIGHTING)
+
+        # Saturn rings (draw in local equatorial plane after tilt applied)
+        if name == "Saturn":
+            glPushMatrix()
+            inner = 1.3 * radius
+            outer = 3.2 * radius
+            # slight scale for visibility; draw ring centered at planet
+            if textures.get("saturn_ring.png"):
+                draw_saturn_rings(inner, outer, textures["saturn_ring.png"], segments=360, thickness=0.006)
+            else:
+                draw_saturn_rings(inner, outer, 0, segments=360, thickness=0.006)
+            glPopMatrix()
+
+        glPopMatrix()
+
+    angle += time_step
+    glutSwapBuffers()
+
+def reshape(w, h):
+    global win_w, win_h
+    win_w, win_h = w, h
+    glViewport(0, 0, w, h)
+    glMatrixMode(GL_PROJECTION)
+    glLoadIdentity()
+    gluPerspective(45.0, float(w)/float(h if h>0 else 1), 0.1, 200.0)
+    glMatrixMode(GL_MODELVIEW)
+
+def mouse(button, state, x, y):
+    global mouse_down, last_x, last_y
+    if button == GLUT_LEFT_BUTTON:
+        mouse_down = (state == GLUT_DOWN)
+        last_x, last_y = x, y
+    elif button == 3:
+        zoom(-1)
+    elif button == 4:
+        zoom(1)
+
+def zoom(delta):
+    global cam_dist
+    cam_dist += delta
+    cam_dist = max(5.0, min(80.0, cam_dist))
+
+def motion(x, y):
+    global last_x, last_y, cam_angle_x, cam_angle_y
+    if mouse_down:
+        dx = x - last_x
+        dy = y - last_y
+        cam_angle_y += dx * 0.3
+        cam_angle_x += dy * 0.2
+        cam_angle_x = max(-89, min(89, cam_angle_x))
+        last_x, last_y = x, y
+
+def keyboard(key, x, y):
+    k = key.decode("utf-8")
+    if k == 'q' or ord(key) == 27:
+        sys.exit(0)
+    elif k == 'p':
+        global time_step
+        time_step = 0 if time_step != 0 else 0.6
+
+def main():
+    glutInit(sys.argv)
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB | GLUT_DEPTH)
+    glutInitWindowSize(win_w, win_h)
+    glutCreateWindow(b"Realistic Solar System - PyOpenGL + GLUT (rings fixed)")
+    init_gl()
+    glutDisplayFunc(display)
+    glutIdleFunc(display)
+    glutReshapeFunc(reshape)
+    glutMouseFunc(mouse)
+    glutMotionFunc(motion)
+    glutKeyboardFunc(keyboard)
+    glutMainLoop()
+
+if __name__ == "__main__":
+    main()
